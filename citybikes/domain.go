@@ -2,7 +2,6 @@ package citybikes
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +18,6 @@ import (
 // citybikes:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone citybikes binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the citybikes driver. It carries no state; the per-run client is
@@ -39,7 +35,7 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "Go CLI for Citybik.es — real-time bike sharing data for 800+ networks worldwide",
 			Long: `Go CLI for Citybik.es — real-time bike sharing data for 800+ networks worldwide
 
-citybikes reads public citybikes data over plain HTTPS, shapes it into
+citybikes reads public Citybik.es data over plain HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
@@ -48,28 +44,31 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `citybikes page` and
-	// `ant get citybikes://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// networks: list all bike-sharing networks, optionally filtered by country.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "networks",
+		Group:   "read",
+		List:    true,
+		Summary: "List bike-sharing networks",
+		URIType: "network",
+	}, listNetworks)
 
-	// List op: members of a page, the home of `citybikes links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// citybikes://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// stations: list docking stations for a given network ID.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "stations",
+		Group:   "read",
+		List:    true,
+		Summary: "List stations for a bike-sharing network",
+		URIType: "station",
+		Args:    []kit.Arg{{Name: "network", Help: "network ID (e.g. citi-bike-nyc)"}},
+	}, listStations)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,86 +87,85 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type networksIn struct {
+	Country string  `kit:"flag" help:"2-letter country code filter (e.g. US)"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type stationsIn struct {
+	Network string  `kit:"arg" help:"network ID (e.g. citi-bike-nyc)"`
+	Client  *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listNetworks(ctx context.Context, in networksIn, emit func(*Network) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	nets, err := in.Client.Networks(ctx, in.Country, limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, n := range nets {
+		if err := emit(n); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full citybikes.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized citybikes reference: %q", input)
+func listStations(ctx context.Context, in stationsIn, emit func(*Station) error) error {
+	if in.Network == "" {
+		return errs.Usage("network ID is required (e.g. citi-bike-nyc)")
 	}
-	return "page", id, nil
+	stations, err := in.Client.Stations(ctx, in.Network)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, s := range stations {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver ---
+
+// Classify turns a reference into (type, id). Citybik.es has two resource
+// types: "network" and "station". A bare id with a slash is treated as a
+// station (network/stationid); otherwise it's a network.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty reference")
+	}
+	parts := strings.SplitN(input, "/", 2)
+	if len(parts) == 2 && parts[1] != "" {
+		return "station", input, nil
+	}
+	return "network", parts[0], nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "network":
+		return BaseURL + "/v2/networks/" + id, nil
+	case "station":
+		parts := strings.SplitN(id, "/", 2)
+		return BaseURL + "/v2/networks/" + parts[0], nil
+	default:
 		return "", errs.Usage("citybikes has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind that carries the
+// right exit code.
 func mapErr(err error) error {
 	return err
 }
