@@ -1,0 +1,10 @@
+title       = "citybikes"
+baseURL     = "https://citybikes-cli.tamnd.com/"
+description = "Go CLI for Citybik.es — real-time bike sharing data for 800+ networks worldwide"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/citybikes-cli"
