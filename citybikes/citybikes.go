@@ -1,35 +1,31 @@
 // Package citybikes is the library behind the citybikes command line:
-// the HTTP client, request shaping, and the typed data models for citybikes.
+// the HTTP client, request shaping, and the typed data models for the
+// Citybik.es API (https://api.citybik.es/v2/).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package citybikes
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to citybikes. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "citybikes/dev (+https://github.com/tamnd/citybikes-cli)"
+// DefaultUserAgent identifies the client to Citybik.es.
+const DefaultUserAgent = "citybikes-cli/0.1 (tamnd87@gmail.com)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at citybikes.com; change it once you
-// know the real endpoints you want to read.
-const Host = "citybikes.com"
+// Host is the API host this client talks to.
+const Host = "api.citybik.es"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to citybikes over HTTP.
+// Client talks to the Citybik.es API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,14 +36,14 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 15s timeout, a 500ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: 15 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
@@ -123,48 +119,84 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on citybikes.com. It is a stand-in for the typed records you
-// will model from the real citybikes endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `citybikes cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (internal JSON shapes) ---
+
+type wireNetwork struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Location struct {
+		City      string  `json:"city"`
+		Country   string  `json:"country"`
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+	} `json:"location"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
+type wireStation struct {
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Latitude   float64 `json:"latitude"`
+	Longitude  float64 `json:"longitude"`
+	Timestamp  string  `json:"timestamp"`
+	FreeBikes  int     `json:"free_bikes"`
+	EmptySlots int     `json:"empty_slots"`
+}
+
+// --- output types ---
+
+// Network represents one bike-sharing network in the Citybik.es directory.
+type Network struct {
+	ID      string `kit:"id" json:"id"`
+	Name    string `json:"name"`
+	City    string `json:"city"`
+	Country string `json:"country"`
+	Lat     string `json:"lat"`
+	Lon     string `json:"lon"`
+}
+
+// Station represents one docking station within a bike-sharing network.
+type Station struct {
+	ID         string `kit:"id" json:"id"`
+	Name       string `json:"name"`
+	FreeBikes  int    `json:"free_bikes"`
+	EmptySlots int    `json:"empty_slots"`
+	Lat        string `json:"lat"`
+	Lon        string `json:"lon"`
+	Updated    string `json:"updated"`
+}
+
+// --- API methods ---
+
+// Networks returns all bike-sharing networks, optionally filtered by country
+// code (case-insensitive, e.g. "US"). limit caps the returned slice; 0 = all.
+func (c *Client) Networks(ctx context.Context, country string, limit int) ([]*Network, error) {
+	url := BaseURL + "/v2/networks?fields=id,name,location"
 	body, err := c.Get(ctx, url)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("networks: %w", err)
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var resp struct {
+		Networks []wireNetwork `json:"networks"`
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("networks: decode: %w", err)
+	}
+
+	var out []*Network
+	for i := range resp.Networks {
+		w := &resp.Networks[i]
+		if country != "" && !eqFold(w.Location.Country, country) {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
+		out = append(out, &Network{
+			ID:      w.ID,
+			Name:    w.Name,
+			City:    w.Location.City,
+			Country: w.Location.Country,
+			Lat:     fmt.Sprintf("%.4f", w.Location.Latitude),
+			Lon:     fmt.Sprintf("%.4f", w.Location.Longitude),
+		})
 		if limit > 0 && len(out) >= limit {
 			break
 		}
@@ -172,29 +204,55 @@ func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// Stations returns all docking stations for a network by its ID (e.g. "citi-bike-nyc").
+func (c *Client) Stations(ctx context.Context, networkID string) ([]*Station, error) {
+	url := BaseURL + "/v2/networks/" + networkID
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, fmt.Errorf("stations %s: %w", networkID, err)
 	}
-	return out
+
+	var resp struct {
+		Network struct {
+			Stations []wireStation `json:"stations"`
+		} `json:"network"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("stations %s: decode: %w", networkID, err)
+	}
+
+	out := make([]*Station, 0, len(resp.Network.Stations))
+	for i := range resp.Network.Stations {
+		w := &resp.Network.Stations[i]
+		out = append(out, &Station{
+			ID:         w.ID,
+			Name:       w.Name,
+			FreeBikes:  w.FreeBikes,
+			EmptySlots: w.EmptySlots,
+			Lat:        fmt.Sprintf("%.4f", w.Latitude),
+			Lon:        fmt.Sprintf("%.4f", w.Longitude),
+			Updated:    w.Timestamp,
+		})
+	}
+	return out, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// eqFold reports whether a and b are equal ignoring ASCII case.
+func eqFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return s
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'a' && ca <= 'z' {
+			ca -= 32
+		}
+		if cb >= 'a' && cb <= 'z' {
+			cb -= 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
